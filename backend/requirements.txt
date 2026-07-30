@@ -5,7 +5,19 @@ pydantic>=2.9.2
 python-dotenv==1.0.1
 python-multipart>=0.0.12
 openai==1.54.4
-# ^ used for Groq too (OpenAI-compatible API, no separate SDK needed)
+# ^ used for Groq too (OpenAI-compatible API, no separate SDK needed).
+# Still used directly by simulator.py's CustomerSimulator; agents.py's
+# agent pipeline talks to providers through langchain-openai instead.
+
+langchain-core>=0.3.0,<0.4.0
+langchain-openai>=0.2.0,<0.3.0
+# ^ Powers the multi-agent orchestration in agents.py: LCEL (Runnable /
+# RunnableLambda / RunnablePassthrough) wires the four agents into a single
+# declarative pipeline (with the Response Coaching and Quality Monitoring
+# agents running concurrently), and ChatOpenAI + `.with_fallbacks()` gives
+# the Groq -> Gemini -> OpenAI provider failover chain natively instead of a
+# hand-written retry loop. All three providers work through langchain-openai
+# since they expose OpenAI-compatible chat completion endpoints.
 
 chromadb==1.5.9
 # ^ Vector store for the Knowledge Recommendation Agent's RAG pipeline.

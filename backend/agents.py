@@ -4,6 +4,19 @@ import json
 from typing import List, Dict, Any, Optional
 from backend.rag import rag_engine
 
+# LangChain: used for two things in this file --
+# 1. `call_llm` / `get_llm_client` -- chat-model instantiation + automatic
+#    provider failover (Groq -> Gemini -> OpenAI), replacing the hand-rolled
+#    for-loop-over-providers that used to live here.
+# 2. `AgentOrchestrator` -- the actual multi-agent *orchestration*: the four
+#    agents are wired together as a declarative LCEL graph (Runnable chain)
+#    instead of a straight-line sequence of Python calls, so independent
+#    steps (Response Coaching + Quality Monitoring, which only depend on the
+#    Understanding Agent's output, not on each other) execute concurrently.
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+
 # Helper regex to extract emails or numbers
 EMAIL_REGEX = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
 ORDER_REGEX = re.compile(r'\b[A-Za-z0-9]{8,12}\b')
@@ -535,52 +548,93 @@ class QualityMonitoringAgent:
 
 # Orchestrator to coordinate the pipeline
 class AgentOrchestrator:
+    """
+    Wires the four specialist agents together into a single pipeline using
+    LangChain's LCEL (`Runnable`) primitives instead of a hand-written
+    sequence of Python method calls.
+
+    Pipeline shape:
+
+        understand  -->  retrieve (RAG)  -->  { coach, monitor } (parallel)  -->  merge
+
+    - `understand` and `retrieve` are inherently sequential: retrieval needs
+      the detected intent.
+    - `coach` (ResponseCoachingAgent) and `monitor` (QualityMonitoringAgent)
+      each only depend on the understanding + history/docs already computed,
+      not on each other's output, so they're expressed with
+      `RunnablePassthrough.assign(...)`. LCEL runs the keys assigned that
+      way concurrently (via a thread pool for sync `.invoke()`), which means
+      the two LLM calls actually happen in parallel instead of back-to-back
+      as in the original implementation -- a real orchestration win, not
+      just a refactor.
+    """
+
     def __init__(self):
         self.understanding_agent = CustomerUnderstandingAgent()
         self.knowledge_agent = KnowledgeAgent()
         self.coaching_agent = ResponseCoachingAgent()
         self.quality_agent = QualityMonitoringAgent()
+        self.pipeline: Runnable = self._build_pipeline()
 
-    def run_pipeline(self, history: List[Dict[str, str]], last_customer_message: str, agent_last_reply: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Runs the full coaching pipeline.
-        Returns a single frame matching CoachingResponse structure.
-        """
-        # Determine if LLM keys are configured
-        llm_client = get_llm_client()
+    def _build_pipeline(self) -> Runnable:
+        understand_step = RunnableLambda(
+            lambda x: {
+                **x,
+                "understanding": self.understanding_agent.analyze(
+                    x["message"], x["history"], x["llm_client"]
+                ),
+            }
+        ).with_config({"run_name": "understand_customer"})
 
-        # Step 1: Customer Understanding
-        understanding = self.understanding_agent.analyze(last_customer_message, history, llm_client)
-        
-        # Step 2: Knowledge Retrieval (RAG)
-        retrieved_docs = self.knowledge_agent.retrieve(last_customer_message, understanding["intent"])
-        
-        # Step 3: Suggested Responses & Coaching
-        coaching = self.coaching_agent.get_suggestions_and_coaching(
-            message=last_customer_message,
-            intent=understanding["intent"],
-            sentiment=understanding["sentiment"],
-            retrieved_docs=retrieved_docs,
-            history=history,
-            agent_last_reply=agent_last_reply,
-            llm_client=llm_client
-        )
-        
-        # Step 4: Quality & Escalation Monitoring
-        quality = self.quality_agent.monitor(
-            history=history,
-            sentiment=understanding["sentiment"],
-            intent=understanding["intent"],
-            llm_client=llm_client
-        )
+        retrieve_step = RunnableLambda(
+            lambda x: {
+                **x,
+                "retrieved_docs": self.knowledge_agent.retrieve(
+                    x["message"], x["understanding"]["intent"]
+                ),
+            }
+        ).with_config({"run_name": "retrieve_knowledge"})
 
-        # Merge results
+        # RunnablePassthrough.assign keeps every existing key on the input
+        # dict (message, history, llm_client, understanding, retrieved_docs,
+        # ...) while adding "coaching" and "quality", computing both
+        # concurrently since neither depends on the other.
+        coach_and_monitor_step = RunnablePassthrough.assign(
+            coaching=RunnableLambda(
+                lambda x: self.coaching_agent.get_suggestions_and_coaching(
+                    message=x["message"],
+                    intent=x["understanding"]["intent"],
+                    sentiment=x["understanding"]["sentiment"],
+                    retrieved_docs=x["retrieved_docs"],
+                    history=x["history"],
+                    agent_last_reply=x.get("agent_last_reply"),
+                    llm_client=x["llm_client"],
+                )
+            ),
+            quality=RunnableLambda(
+                lambda x: self.quality_agent.monitor(
+                    history=x["history"],
+                    sentiment=x["understanding"]["sentiment"],
+                    intent=x["understanding"]["intent"],
+                    llm_client=x["llm_client"],
+                )
+            ),
+        ).with_config({"run_name": "coach_and_monitor_parallel"})
+
+        merge_step = RunnableLambda(self._merge_results).with_config({"run_name": "merge_results"})
+
+        return understand_step | retrieve_step | coach_and_monitor_step | merge_step
+
+    def _merge_results(self, x: Dict[str, Any]) -> Dict[str, Any]:
+        understanding, retrieved_docs = x["understanding"], x["retrieved_docs"]
+        coaching, quality = x["coaching"], x["quality"]
+
         ai_sources = {
             "understanding": understanding.get("_source", "mock"),
             "coaching": coaching.get("_source", "mock"),
             "quality": quality.get("_source", "mock"),
         }
-        result = {
+        return {
             "intent": understanding["intent"],
             "sentiment": understanding["sentiment"],
             "tones": understanding["tones"],
@@ -600,8 +654,22 @@ class AgentOrchestrator:
             "ai_generated": all(v == "llm" for v in ai_sources.values()),
             "ai_sources": ai_sources,
         }
-        
-        return result
+
+    def run_pipeline(self, history: List[Dict[str, str]], last_customer_message: str, agent_last_reply: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Runs the full coaching pipeline (LCEL graph built in __init__).
+        Returns a single frame matching CoachingResponse structure -- same
+        return shape as before, only the wiring underneath changed.
+        """
+        inputs = {
+            "message": last_customer_message,
+            "history": history,
+            "agent_last_reply": agent_last_reply,
+            # Determine if LLM keys are configured (per-call, same as before,
+            # since env vars / mock-mode can change between calls in tests).
+            "llm_client": get_llm_client(),
+        }
+        return self.pipeline.invoke(inputs)
 
     def generate_final_report(self, history: List[Dict[str, str]], analysis_history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -724,56 +792,68 @@ _PROVIDER_DEFAULTS = {
     },
 }
 
-def get_llm_client() -> Optional[Dict[str, Any]]:
+class LLMClient:
     """
-    Builds the ordered list of configured LLM providers from environment
-    variables. Returns None if no provider is configured at all (mock mode).
+    Thin wrapper around a LangChain chat-model `Runnable`. The runnable
+    itself is `primary.with_fallbacks([fallback_1, fallback_2, ...])`, so
+    provider failover (Groq -> Gemini -> OpenAI) is handled natively by
+    LangChain: if the primary provider raises, LangChain automatically
+    retries with the next one in the list before giving up.
+
+    `provider_names` is kept only as introspection metadata (e.g. for
+    test_agents_individual.py to print which providers are active); it
+    plays no role in the actual failover, which happens inside `runnable`.
     """
-    providers = []
+    def __init__(self, runnable: Runnable, provider_names: List[str]):
+        self.runnable = runnable
+        self.provider_names = provider_names
+
+    def invoke(self, messages: List[Any]) -> str:
+        return self.runnable.invoke(messages).content
+
+
+def get_llm_client() -> Optional[LLMClient]:
+    """
+    Builds a LangChain chat model (with `.with_fallbacks()` chaining across
+    whichever providers are configured via env vars, Groq -> Gemini ->
+    OpenAI). Returns None if no provider is configured at all (mock mode).
+    """
+    models: List[ChatOpenAI] = []
+    provider_names: List[str] = []
 
     for name, cfg in _PROVIDER_DEFAULTS.items():
         key = os.getenv(cfg["env_key"])
-        if key:
-            providers.append({
-                "provider": name,
-                "key": key,
-                "base_url": cfg["base_url"],
-                "model": os.getenv(cfg["model_env"], cfg["default_model"]),
-            })
-    if not providers:
+        if not key:
+            continue
+        models.append(
+            ChatOpenAI(
+                api_key=key,
+                base_url=cfg["base_url"],
+                model=os.getenv(cfg["model_env"], cfg["default_model"]),
+                temperature=0.2,
+                max_retries=0,  # no per-provider retries -- fail fast onto the next provider
+                timeout=30,
+            ).with_config({"run_name": f"llm:{name}"})
+        )
+        provider_names.append(name)
+
+    if not models:
         return None
-    return {"providers": providers}
 
-def call_llm(prompt: str, client: Dict[str, Any], system_prompt: Optional[str] = None) -> str:
-    from openai import OpenAI
+    primary, *fallbacks = models
+    runnable = primary.with_fallbacks(fallbacks) if fallbacks else primary
+    return LLMClient(runnable, provider_names)
 
-    providers = client.get("providers", [])
-    if not providers:
+def call_llm(prompt: str, client: LLMClient, system_prompt: Optional[str] = None) -> str:
+    if client is None:
         raise RuntimeError("No LLM providers configured")
 
     messages = []
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(HumanMessage(content=prompt))
 
-    last_error: Optional[Exception] = None
-    for p in providers:
-        try:
-            provider_client = OpenAI(api_key=p["key"], base_url=p["base_url"])
-            response = provider_client.chat.completions.create(
-                model=p["model"],
-                messages=messages,
-                temperature=0.2
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"[call_llm] Provider '{p['provider']}' failed ({e}); trying next provider if available.")
-            last_error = e
-            continue
-
-    # Every configured provider failed -- surface the last error so the
-    # caller's except block logs it and falls back to mock logic.
-    raise last_error if last_error else RuntimeError("All configured LLM providers failed")
+    return client.invoke(messages).strip()
 
 def extract_json_block(text: str) -> str:
     # Extracts code block if wrapped in markdown
