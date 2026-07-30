@@ -1,0 +1,16 @@
+# Copy this file to .env and fill in your own values.
+# NEVER commit the real .env file — it is excluded via .gitignore.
+
+# --- OPTION 1: Groq API Key (Free ~100k tokens/day, fastest) ---
+# Get a key at https://console.groq.com/keys
+# GROQ_API_KEY=
+# GROQ_MODEL=llama-3.3-70b-versatile
+
+# --- OPTION 2: Google Gemini (Free 1M tokens/day) ---
+# Get a free key at https://aistudio.google.com
+# GEMINI_API_KEY=
+# GEMINI_MODEL=gemini-2.0-flash
+
+# --- OPTION 3: OpenAI API Key ---
+# OPENAI_API_KEY=
+# OPENAI_MODEL=gpt-4o-mini

@@ -1,0 +1,31 @@
+fastapi>=0.115.6
+uvicorn>=0.30.6
+websockets>=12.0
+pydantic>=2.9.2
+python-dotenv==1.0.1
+python-multipart>=0.0.12
+openai==1.54.4
+# ^ used for Groq too (OpenAI-compatible API, no separate SDK needed)
+
+chromadb==1.5.9
+# ^ Vector store for the Knowledge Recommendation Agent's RAG pipeline.
+# Uses chromadb's built-in local ONNX embedding model (onnxruntime, already
+# a dependency of chromadb) -- no PyTorch/GPU required, no external API key
+# needed. On first run it downloads a small (~90MB) embedding model and
+# caches it; if that download is blocked (offline/firewalled), rag.py
+# automatically falls back to a pure-Python TF-IDF matcher with no crash.
+
+pypdf==5.9.0
+python-docx==1.1.2
+# ^ REQUIRED for real PDF/DOCX text extraction in rag.py's knowledge base
+# upload feature. Without these, _extract_text_from_pdf() silently falls
+# back to a crude byte-scraper that pulls raw compressed PDF stream data
+# and metadata gibberish instead of the actual document text -- uploaded
+# PDFs would get "ingested" as garbage that never matches any query.
+
+# NOTE: fastapi/uvicorn/pydantic/websockets/python-multipart use minimum-
+# version bounds (not exact pins) rather than the original tight pins --
+# chromadb requires uvicorn[standard] with its own version floor, and an
+# exact pin elsewhere conflicts with that. Bounds let pip resolve a
+# consistent set; all versions above have confirmed prebuilt wheels for
+# Python 3.13 on Windows (no Rust/C compiler needed).
