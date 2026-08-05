@@ -13,9 +13,10 @@ from backend.rag import rag_engine
 #    instead of a straight-line sequence of Python calls, so independent
 #    steps (Response Coaching + Quality Monitoring, which only depend on the
 #    Understanding Agent's output, not on each other) execute concurrently.
-from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI 
 
 # Helper regex to extract emails or numbers
 EMAIL_REGEX = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
