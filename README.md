@@ -76,7 +76,7 @@ Every customer message and every agent reply is analyzed and streamed back over 
 
 <div align="center">
 
-![Architecture Diagram](./architecture-diagram.png)
+![Architecture Diagram](https://raw.githubusercontent.com/SoumyadeepChattopadhyay2004/AI_Customer_Support_Coaching_Assistant/main/architecture.png)
 
 </div>
 
